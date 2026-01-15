@@ -379,6 +379,24 @@ classdef ea_sweetspot < handle
                 I = I(:);
             else
                 Ihat = ea_nanmean(Ihat,2); % compare bodyscores (patient wise)
+                %option 1
+                % for i = 1:length(Ihat)
+                %     if abs(Ihat(i,1))>abs(Ihat(i,2))
+                %         Ihat_new(i) = Ihat(i,1);
+                %     else
+                %         Ihat_new(i) = Ihat(i,2);
+                %     end
+                % end       
+                %option 2
+                % for i = 1:length(Ihat)
+                %     if (Ihat(i,1) <0) && (Ihat(i,2) < 0)
+                %         Ihat_new(i) = min(Ihat(i,:));
+                %     else
+                %         Ihat_new(i) = max(Ihat(i,:));
+                %     end
+                % end     
+                % 
+                % Ihat = Ihat_new';
             end
         end
 
