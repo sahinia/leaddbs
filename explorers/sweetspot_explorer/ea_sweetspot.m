@@ -56,6 +56,8 @@ classdef ea_sweetspot < handle
         % additional settings:
         rngseed = 'default';
         Nperm = 1000 % how many permutations in leave-nothing-out permtest strategy
+        permtestMaxWorkers = 3 % cap on parallel workers used by permtest/predpermtest's parfor loops. Each worker holds its own full copy of obj (incl. obj.results.efield), so too many workers can exhaust memory on large analyses -- tune per-machine if needed.
+        stratifyPermutationsByGroup = 0 % if true, permtest shuffles obj.responsevar only within obj.M.patient.group buckets. Independent of splitbygroup (which is mainly a visualization/coloring setting) -- does not affect or get affected by it.
         kfold = 5 % divide into k sets when doing k-fold CV
         Nsets = 5 % divide into N sets when doing Custom (random) set test
         adjustforgroups = 1 % adjust correlations for group effects
@@ -437,6 +439,146 @@ classdef ea_sweetspot < handle
             Iperm = Iperm(obj.patientselection,:);
         end
 
+        function permresults = permtest(obj, Nperm, corrType)
+            % Voxelwise permutation test of the sweetspot correlation map.
+            % Permutes obj.responsevar (group-restricted, NaN-excluded, tied
+            % across sides/mirrors since permutation happens before the L/R &
+            % mirror expansion in ea_sweetspot_calcstats), rebuilds the map
+            % for each permutation, and saves the resulting empirical +
+            % permuted voxelwise R/p maps for later statistical comparison.
+            if ~exist('Nperm', 'var') || isempty(Nperm)
+                Nperm = obj.Nperm;
+            end
+            if ~exist('corrType', 'var') || isempty(corrType)
+                corrType = obj.corrtype;
+            end
+
+            if ~strcmp(obj.statlevel, 'E-Fields') || ~strcmp(obj.stattest, 'Correlations')
+                ea_error('permtest is currently only implemented for statlevel = ''E-Fields'' with stattest = ''Correlations''.');
+            end
+
+            if size(obj.responsevar, 2) > 1
+                ea_error('Hemiscore responsevar (2 columns) is not yet supported for permutation testing.');
+            end
+
+            patsel = obj.patientselection;
+
+            if obj.stratifyPermutationsByGroup
+                groupvec = obj.M.patient.group;
+            else
+                groupvec = [];
+            end
+
+            [Iperm, PermIdx] = ea_shuffle_grouped(obj.responsevar, Nperm, patsel, groupvec, obj.rngseed);
+
+            outdir = [fileparts(obj.leadgroup), filesep, 'sweetspots', filesep];
+            ea_mkdir(outdir);
+
+            % Descriptive base filename shared by this run's nifti exports and its
+            % saved .mat -- encodes the options that most affect the result, plus a
+            % timestamp so repeated runs never silently collide/overwrite each other.
+            if obj.stratifyPermutationsByGroup
+                stratTag = 'stratified';
+            else
+                stratTag = 'pooled';
+            end
+            if obj.mirrorsides
+                mirrorTag = 'mirrored';
+            else
+                mirrorTag = 'nonmirrored';
+            end
+            basefname = sprintf('%s_permtest_N%d_%s_%s_%s_%s', obj.ID, Nperm, stratTag, mirrorTag, corrType, datestr(now, 'yyyymmdd_HHMMSS'));
+
+            fprintf('Calculating empirical (unpermuted) sweetspot map...\n');
+            [Remp, pemp, gvalFixed, gpatselFixed, thisvalsFixed, nanidxFixed] = ea_sweetspot_calcstats(obj, patsel, obj.responsevar, true); % skipsigthresh=true: always store raw, unmasked values
+            % gvalFixed/gpatselFixed (coverage-masked efield data & patient
+            % selection) and thisvalsFixed/nanidxFixed (the patient-sliced,
+            % NaN-filtered correlation input derived from them) don't depend on
+            % I/Iperm -- reused for every permutation below instead of being
+            % recomputed (which forces full-matrix copies) on every one of the
+            % Nperm calls.
+
+            % export the empirical (raw, unmasked) R-map to nifti by default, so it
+            % can be sanity-checked against any map generated the usual way (e.g. obj.draw()).
+            for gi = 1:size(Remp,1)
+                if all(cellfun(@isempty, Remp(gi,:)))
+                    continue
+                end
+                ea_sweetspot_vals2nii(obj.results.space, Remp(gi,:), outdir, sprintf('%s_Remp_group%d', basefname, gi));
+            end
+
+            obj.capParpool;
+
+            Rrow = cell(1, Nperm);
+            prow = cell(1, Nperm);
+
+            progress = 0;
+            dq = parallel.pool.DataQueue;
+            afterEach(dq, @(~) reportProgress());
+
+            fprintf('Running %d permutations...\n', Nperm);
+            parfor p = 1:Nperm
+                [v, pv] = ea_sweetspot_calcstats(obj, patsel, Iperm(:,p), true, gvalFixed, gpatselFixed, thisvalsFixed, nanidxFixed);
+                Rrow{p} = v;
+                prow{p} = pv;
+                send(dq, 1);
+            end
+
+            Rperm = cell(size(Remp));
+            pperm = cell(size(Remp));
+            for gi = 1:numel(Remp)
+                if isempty(Remp{gi})
+                    continue
+                end
+                Rperm{gi} = nan(Nperm, numel(Remp{gi}));
+                pperm{gi} = nan(Nperm, numel(Remp{gi}));
+                for p = 1:Nperm
+                    Rperm{gi}(p,:) = Rrow{p}{gi}';
+                    pperm{gi}(p,:) = prow{p}{gi}';
+                end
+            end
+
+            permresults.Remp = Remp;
+            permresults.pemp = pemp;
+            permresults.Rperm = Rperm;
+            permresults.pperm = pperm;
+            permresults.PermIdx = PermIdx;
+            permresults.Nperm = Nperm;
+            permresults.rngseed = obj.rngseed;
+            permresults.corrtype = corrType;
+            permresults.splitbygroup = obj.splitbygroup; % visualization/coloring setting -- not what governed the shuffle, kept only for reference
+            permresults.stratifyPermutationsByGroup = obj.stratifyPermutationsByGroup; % this is what actually governed the shuffle
+            permresults.mirrorsides = obj.mirrorsides;
+            permresults.patientselection = patsel;
+            permresults.statlevel = obj.statlevel;
+            permresults.stattest = obj.stattest;
+            permresults.coverthreshold = obj.coverthreshold;
+            permresults.efieldthreshold = obj.efieldthreshold;
+            permresults.space = obj.results.space; % training grid geometry, needed for out-of-sample reslicing later
+            permresults.ID = obj.ID;
+            permresults.leadgroup = obj.leadgroup;
+
+            outfile = [outdir, basefname, '.mat'];
+            suffix = 1;
+            while exist(outfile, 'file') % timestamp makes this vanishingly rare, but never silently overwrite
+                suffix = suffix + 1;
+                outfile = [outdir, basefname, '_', num2str(suffix), '.mat'];
+            end
+            permresults.savedfile = outfile;
+            save(outfile, '-struct', 'permresults', '-v7.3');
+            fprintf('Saved permutation results to %s\n', outfile);
+
+            function reportProgress()
+                % Called on the client (not inside the workers) each time a
+                % worker finishes one permutation, via the DataQueue above.
+                progress = progress + 1;
+                step = max(1, round(Nperm/20)); % ~5% increments
+                if mod(progress, step) == 0 || progress == Nperm
+                    fprintf('Permutation progress: %d/%d (%.0f%%)\n', progress, Nperm, 100*progress/Nperm);
+                end
+            end
+        end
+
         function save(obj)
             sweetspot=obj;
             pth = fileparts(sweetspot.leadgroup);
@@ -636,6 +778,276 @@ classdef ea_sweetspot < handle
                 obj.colorbar.cmap = voxcmap;
                 obj.colorbar.tick = tick;
                 obj.colorbar.ticklabel = ticklabel;
+            end
+        end
+
+        function predresults = predpermtest(obj, trainPermtestFile, sigMode)
+            % Out-of-sample validation of a voxelwise permutation test (built
+            % via permtest() on a *different*, training ea_sweetspot object)
+            % against this (test) object's own, never-permuted patient
+            % scores. Each permuted (and the empirical) training map is
+            % reprojected onto this object's own efield grid via a one-time
+            % nearest-neighbor index map -- the geometric correspondence
+            % only depends on the two objects' obj.results.space, not on the
+            % map values, so it is computed once and reused for every
+            % permutation instead of reslicing Nperm+1 times.
+            %
+            % sigMode controls uncorrected significance thresholding (using
+            % obj.alphalevel, evaluated on this -- the test -- object) before
+            % prediction, matching how the empirical model is normally
+            % restricted to significant voxels only:
+            %   'None'        - no thresholding, raw R everywhere (default)
+            %   'Independent' - each map (empirical & every permutation) is
+            %                   thresholded using its own p-values
+            %   'Fixed'       - the empirical map's significant-voxel mask is
+            %                   computed once and applied to every permutation
+
+            if size(obj.responsevar, 2) > 1
+                ea_error('Hemiscore responsevar (2 columns) is not yet supported for permutation testing.');
+            end
+
+            if ~exist('sigMode', 'var') || isempty(sigMode)
+                sigMode = 'None';
+            end
+            if ~ismember(sigMode, {'None', 'Independent', 'Fixed'})
+                ea_error('sigMode must be ''None'', ''Independent'', or ''Fixed''.');
+            end
+
+            train = load(trainPermtestFile);
+
+            nsides = numel(obj.results.space);
+            srcIdx = cell(1, nsides);
+            testUncovered = zeros(1, nsides);
+            testTotal = zeros(1, nsides);
+            trainUncovered = zeros(1, nsides);
+            trainTotal = zeros(1, nsides);
+
+            fprintf('Voxel coverage report (training grid vs. this object''s test grid):\n');
+            for side = 1:nsides
+                srcIdx{side} = ea_sweetspot_nnindexmap(train.space{side}, obj.results.space{side});
+
+                testTotal(side) = numel(srcIdx{side});
+                testUncovered(side) = sum(isnan(srcIdx{side}));
+
+                trainTotal(side) = numel(train.space{side}.img);
+                covered = unique(srcIdx{side}(~isnan(srcIdx{side})));
+                trainUncovered(side) = trainTotal(side) - numel(covered);
+
+                fprintf(['  Side %d: %d/%d (%.1f%%) test-grid voxels have no corresponding training voxel.\n', ...
+                    '           %d/%d (%.1f%%) training-grid voxels are not represented anywhere in the test grid.\n'], ...
+                    side, testUncovered(side), testTotal(side), 100*testUncovered(side)/testTotal(side), ...
+                    trainUncovered(side), trainTotal(side), 100*trainUncovered(side)/trainTotal(side));
+            end
+
+            if isempty(obj.customselection)
+                patsel = obj.patientselection;
+            else
+                patsel = obj.customselection;
+            end
+            Nperm = train.Nperm;
+
+            % Uncorrected significance thresholding (training-grid space, before
+            % reprojection -- Remp/pemp and Rperm/pperm share the same voxel
+            % indexing, so this is a plain elementwise mask).
+            alphalevel = obj.alphalevel;
+            Remp_train = train.Remp(1,:);
+            if ~strcmp(sigMode, 'None')
+                for side = 1:nsides
+                    nonsig = isnan(train.pemp{1,side}) | train.pemp{1,side} > alphalevel;
+                    Remp_train{side}(nonsig) = nan;
+                end
+            end
+            fixedMask = cell(1, nsides); % only used when sigMode == 'Fixed'
+            if strcmp(sigMode, 'Fixed')
+                for side = 1:nsides
+                    fixedMask{side} = ~isnan(Remp_train{side}); % logical, training-grid space
+                end
+            end
+
+            % validMask/efieldT are both independent of which map (empirical or
+            % which permutation) is being predicted -- precomputed once and reused
+            % below instead of being recomputed on every one of the Nperm+1 calls.
+            validMask = cell(1, nsides);
+            efieldT = cell(1, nsides);
+            for side = 1:nsides
+                validMask{side} = ~isnan(srcIdx{side});
+                efieldT{side} = obj.results.efield{side}(patsel,:)';
+            end
+
+            fprintf('Predicting from empirical (unpermuted) training map...\n');
+            empvals = cell(1, nsides);
+            for side = 1:nsides
+                empvals{side} = nan(numel(srcIdx{side}), 1);
+                empvals{side}(validMask{side}) = Remp_train{side}(srcIdx{side}(validMask{side}));
+            end
+            [Rpredemp, Rpredemp_pval, Ihatemp] = obj.predictfromvals(empvals, patsel, train.corrtype, efieldT);
+            if isnan(Rpredemp)
+                ea_error('Empirical out-of-sample prediction is NaN -- cannot rank against the null distribution. Check basepredictionon/posvisible/negvisible settings and voxel coverage.');
+            end
+
+            fprintf('Predicting from %d permuted training maps...\n', Nperm);
+            Rpredperm = nan(Nperm, 1);
+            obj.capParpool;
+
+            % Pull Rperm/pperm out of the train struct into flat, directly-indexed
+            % matrices before the parfor. train.Rperm{1,side}(p,:) is nested
+            % struct/cell/row indexing, which parfor cannot recognize as a sliced
+            % access -- it would instead broadcast the ENTIRE train struct (incl.
+            % all Nperm rows of Rperm/pperm for both sides, potentially larger
+            % than obj.results.efield since Nperm often exceeds patient count) to
+            % every worker. Rperm1(p,:) below, by contrast, is a plain top-level
+            % matrix indexed directly by the loop variable, which parfor slices
+            % properly -- each worker only receives the rows it actually needs.
+            Rperm1 = train.Rperm{1,1};
+            pperm1 = train.pperm{1,1};
+            if nsides >= 2
+                Rperm2 = train.Rperm{1,2};
+                pperm2 = train.pperm{1,2};
+            else
+                Rperm2 = [];
+                pperm2 = [];
+            end
+            corrType = train.corrtype;
+
+            parfor p = 1:Nperm
+                permvals = cell(1, nsides);
+                for side = 1:nsides
+                    permvals{side} = nan(numel(srcIdx{side}), 1);
+                    valid = validMask{side};
+                    if side == 1
+                        row = Rperm1(p,:);
+                        prow = pperm1(p,:);
+                    else
+                        row = Rperm2(p,:);
+                        prow = pperm2(p,:);
+                    end
+                    switch sigMode
+                        case 'Independent'
+                            row(isnan(prow) | prow > alphalevel) = nan;
+                        case 'Fixed'
+                            row(~fixedMask{side}) = nan;
+                    end
+                    permvals{side}(valid) = row(srcIdx{side}(valid));
+                end
+                Rpredperm(p) = obj.predictfromvals(permvals, patsel, corrType, efieldT);
+            end
+
+            % A permutation whose map produced no defined prediction (NaN -- e.g.
+            % zero significant voxels under sigMode='Independent') is itself
+            % evidence against the null being able to predict, not missing data:
+            % it stays in the denominator and counts as not exceeding the
+            % empirical result (comparisons against NaN are always false in
+            % MATLAB, which already gives this behavior -- made explicit here
+            % rather than left implicit, and reported instead of silent).
+            nNaNperm = sum(isnan(Rpredperm));
+            exceedCount = sum(abs(Rpredperm) >= abs(Rpredemp));
+            Rp0 = sort(abs(Rpredperm), 'descend'); % NaNs sort to the end automatically
+            Rp95 = Rp0(round(0.05*Nperm));
+            pperm = exceedCount / Nperm;
+            fprintf('%d/%d permutations (%.1f%%) produced no defined prediction (NaN) -- counted as not exceeding the empirical result.\n', nNaNperm, Nperm, 100*nNaNperm/Nperm);
+            disp(['Out-of-sample permuted p = ', sprintf('%0.3f', pperm), ' (empirical R ranks ', num2str(exceedCount), ' of ', num2str(Nperm), ').']);
+
+            predresults.Rpredemp = Rpredemp;
+            predresults.Rpredemp_pval = Rpredemp_pval; % parametric p-value of the empirical correlation itself (distinct from pperm, the permutation-based null p-value)
+            predresults.Ihatemp = Ihatemp; % per-patient predicted score underlying Rpredemp
+            predresults.Iemp = obj.responsevar(patsel); % this object's real, unpermuted scores -- both saved so the correlation plot can be regenerated standalone later (ea_sweetspot_predpermtest_plot), without a live object
+            predresults.responsevarlabel = obj.responsevarlabel;
+            predresults.Rpredperm = Rpredperm;
+            predresults.nNaNperm = nNaNperm; % permutations with no defined prediction, counted as not exceeding Rpredemp (see pperm)
+            predresults.exceedCount = exceedCount; % how many (of Nperm) permutations were >= |Rpredemp|; pperm = exceedCount/Nperm
+            predresults.pperm = pperm;
+            predresults.Rp95 = Rp95;
+            predresults.trainPermIdx = train.PermIdx; % training cohort's shuffle indices (NOT the test cohort -- this object's own patients are never permuted). Columns correspond 1:1 to Rpredperm entries, traceable to the training permtest that produced each permuted map.
+            predresults.trainPermtestFile = trainPermtestFile;
+            predresults.trainID = train.ID;
+            predresults.testID = obj.ID;
+            predresults.corrtype = train.corrtype;
+            predresults.basepredictionon = obj.basepredictionon;
+            predresults.sigMode = sigMode;
+            predresults.alphalevel = alphalevel;
+            predresults.testUncoveredVoxels = testUncovered;
+            predresults.testTotalVoxels = testTotal;
+            predresults.trainUncoveredVoxels = trainUncovered;
+            predresults.trainTotalVoxels = trainTotal;
+
+            outdir = [fileparts(obj.leadgroup), filesep, 'sweetspots', filesep];
+            ea_mkdir(outdir);
+
+            % Filename identifies which training run this test cohort was checked
+            % against (a test cohort may be validated against several different
+            % training analyses for different purposes -- each gets its own file
+            % instead of overwriting the last one), plus sigMode and a timestamp.
+            [~, trainBaseName] = fileparts(trainPermtestFile);
+            basefname = sprintf('%s_predpermtest_vs_%s_%s_%s', obj.ID, trainBaseName, sigMode, datestr(now, 'yyyymmdd_HHMMSS'));
+            outfile = [outdir, basefname, '.mat'];
+            suffix = 1;
+            while exist(outfile, 'file') % timestamp makes this vanishingly rare, but never silently overwrite
+                suffix = suffix + 1;
+                outfile = [outdir, basefname, '_', num2str(suffix), '.mat'];
+            end
+            predresults.savedfile = outfile;
+            save(outfile, '-struct', 'predresults', '-v7.3');
+            fprintf('Saved out-of-sample permutation prediction results to %s\n', outfile);
+
+            ea_sweetspot_predpermtest_plot(outfile); % shared with standalone re-plotting from a saved file
+        end
+    end
+
+    methods (Access = private)
+        function [Rpred, Rpred_p, Ihat] = predictfromvals(obj, vals, patsel, corrType, efieldTIn)
+            % Replicates the E-Fields prediction logic in crossval() (see
+            % obj.basepredictionon), but takes the voxelwise map(s) directly
+            % rather than recomputing them, so it can be reused across many
+            % permuted maps.
+            %
+            % efieldTIn (optional): precomputed obj.results.efield{side}(patsel,:)'
+            % per side, since that transpose/slice is independent of vals and
+            % otherwise gets recomputed on every one of the Nperm calls a caller
+            % like predpermtest makes.
+            if ~exist('efieldTIn', 'var')
+                efieldTIn = {};
+            end
+            Ihat = nan(length(patsel), numel(vals));
+            for side = 1:numel(vals)
+                v = vals{side};
+                if numel(efieldTIn) >= side && ~isempty(efieldTIn{side})
+                    efieldT = efieldTIn{side};
+                else
+                    efieldT = obj.results.efield{side}(patsel,:)';
+                end
+                switch lower(obj.basepredictionon)
+                    case 'profile of scores: spearman'
+                        Ihat(:,side) = atanh(ea_corr(obj.maskvals(v,obj.posvisible,obj.negvisible), efieldT, 'spearman'));
+                    case 'profile of scores: pearson'
+                        Ihat(:,side) = atanh(ea_corr(obj.maskvals(v,obj.posvisible,obj.negvisible), efieldT, 'pearson'));
+                    case 'profile of scores: bend'
+                        Ihat(:,side) = atanh(ea_corr(obj.maskvals(v,obj.posvisible,obj.negvisible), efieldT, 'bend'));
+                    case 'mean of scores'
+                        Ihat(:,side) = ea_nanmean(obj.maskvals(v,obj.posvisible,obj.negvisible).*efieldT,1);
+                    case 'sum of scores'
+                        Ihat(:,side) = ea_nansum(obj.maskvals(v,obj.posvisible,obj.negvisible).*efieldT,1);
+                    case 'peak of scores'
+                        Ihat(:,side) = ea_discfibers_getpeak(v.*efieldT, obj.posvisible, obj.negvisible, 'peak');
+                    case 'peak 5% of scores'
+                        Ihat(:,side) = ea_discfibers_getpeak(v.*efieldT, obj.posvisible, obj.negvisible, 'peak5');
+                end
+            end
+            Ihat = ea_nanmean(Ihat,2);
+            [Rpred, Rpred_p] = corr(obj.responsevar(patsel), Ihat, 'type', corrType, 'rows', 'pairwise');
+        end
+
+        function capParpool(obj)
+            % Ensures the current parallel pool (if any) has no more than
+            % obj.permtestMaxWorkers workers before a parfor loop starts.
+            % Each worker holds its own full copy of obj (including
+            % obj.results.efield), so an uncapped pool (one worker per core)
+            % can exhaust system memory on large analyses.
+            p = gcp('nocreate');
+            if isempty(p)
+                parpool(obj.permtestMaxWorkers);
+            elseif p.NumWorkers > obj.permtestMaxWorkers
+                delete(p);
+                parpool(obj.permtestMaxWorkers);
             end
         end
     end

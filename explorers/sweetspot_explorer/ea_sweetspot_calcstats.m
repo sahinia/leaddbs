@@ -1,10 +1,46 @@
-function [vals] = ea_sweetspot_calcstats(obj,patsel,Iperm)
+function [vals,pvals,gvalOut,gpatselOut,thisvalsOut,nanidxOut] = ea_sweetspot_calcstats(obj,patsel,Iperm,skipsigthresh,gvalIn,gpatselIn,thisvalsIn,nanidxIn)
 
 if ~exist('Iperm','var')
     I=obj.responsevar;
 else % used in permutation based statistics - in this case the real improvement can be substituted with permuted variables.
     I=Iperm;
 end
+
+if ~exist('skipsigthresh','var')
+    skipsigthresh=false; % if true, vals are returned unmasked regardless of obj.showsignificantonly (used by permutation testing, where thresholding is applied later).
+end
+
+% gvalIn/gpatselIn let a caller reuse a previous call's coverage-masked efield
+% data & patient selection (gvalOut/gpatselOut below) instead of recomputing
+% them -- both are independent of I/Iperm, so permutation-testing callers that
+% run this many times with only I changing can compute them once and skip the
+% (expensive, since it forces a full-matrix copy) coverage-masking step on
+% every subsequent call. Callers that don't pass them just get the original,
+% always-recompute behavior.
+if ~exist('gvalIn','var')
+    gvalIn = {};
+end
+if ~exist('gpatselIn','var')
+    gpatselIn = {};
+end
+gvalOut = {};
+gpatselOut = {};
+
+% thisvalsIn/nanidxIn are the same idea, one step further: for the
+% 'E-Fields'/'Correlations' case specifically, the patient-sliced,
+% NaN-filtered correlation input (thisvals/nanidx below) is ALSO independent
+% of I/Iperm once gval/gpatsel are fixed -- reusing it skips another
+% full-matrix slice-and-filter on every permutation call.
+if ~exist('thisvalsIn','var')
+    thisvalsIn = {};
+end
+if ~exist('nanidxIn','var')
+    nanidxIn = {};
+end
+thisvalsOut = {};
+nanidxOut = {};
+
+pvals = {}; % only populated for the 'E-Fields' / 'Correlations' case; other stattests don't return p-values (yet).
 
 val = obj.results.efield;
 
@@ -54,27 +90,38 @@ else
 end
 
 for group=groups
-    gval=val; %refresh fibsval
-    if dogroups
-        groupspt=find(obj.M.patient.group==group);
-        gpatsel=groupspt(ismember(groupspt,patsel));
+    if numel(gpatselIn)>=group && ~isempty(gpatselIn{group})
+        gpatsel = gpatselIn{group}; % reuse precomputed selection (independent of I/Iperm)
     else
-        gpatsel=patsel;
+        if dogroups
+            groupspt=find(obj.M.patient.group==group);
+            gpatsel=groupspt(ismember(groupspt,patsel));
+        else
+            gpatsel=patsel;
+        end
+        if obj.mirrorsides
+            gpatsel=[gpatsel,gpatsel+length(obj.allpatients)];
+        end
     end
-    if obj.mirrorsides
-        gpatsel=[gpatsel,gpatsel+length(obj.allpatients)];
-    end
+    gpatselOut{group} = gpatsel;
+
+    gval=val; %refresh fibsval
 
     for side=1:numel(gval)
         % check connthreshold
-        switch obj.statlevel
-            case 'VTAs'
-                gval{side}=gval{side}>obj.efieldthreshold; % binarize
-            case 'E-Fields'
-                gval{side}(gval{side}<=obj.efieldthreshold) = nan;
-                Nmap=ea_nansum(gval{side}(gpatsel,:)>obj.efieldthreshold);
-                gval{side}(gpatsel,Nmap<round(length(gpatsel)*(obj.coverthreshold/100)))=nan; % Set pixels to Nan that do not meet coverthreshold criteria
+        if size(gvalIn,1)>=group && size(gvalIn,2)>=side && ~isempty(gvalIn{group,side})
+            gval{side} = gvalIn{group,side}; % reuse precomputed coverage-masked efield data (independent of I/Iperm)
+        else
+            switch obj.statlevel
+                case 'VTAs'
+                    gval{side}=gval{side}>obj.efieldthreshold; % binarize
+                case 'E-Fields'
+                    gval{side}(gval{side}<=obj.efieldthreshold) = nan;
+                    Nmap=ea_nansum(gval{side}(gpatsel,:)>obj.efieldthreshold);
+                    gval{side}(gpatsel,Nmap<round(length(gpatsel)*(obj.coverthreshold/100)))=nan; % Set pixels to Nan that do not meet coverthreshold criteria
+            end
         end
+        gvalOut{group,side} = gval{side};
         switch obj.statlevel
             case 'VTAs'
                 % get amplitudes
@@ -286,18 +333,26 @@ for group=groups
                 switch obj.stattest
                     case 'Correlations'
 
-                        thisvals=gval{side}(gpatsel,:);
-                        nanidx = isnan(ea_nansum(thisvals));
-                        thisvals = thisvals(:, ~nanidx);
-
-                        if obj.showsignificantonly
-                            [R,p]=ea_corr(thisvals,I(gpatsel,side),obj.corrtype);
-                            R=ea_corrsignan(R,p,obj);
+                        if size(thisvalsIn,1)>=group && size(thisvalsIn,2)>=side && ~isempty(thisvalsIn{group,side})
+                            thisvals = thisvalsIn{group,side}; % reuse precomputed, patient-sliced & NaN-filtered input (independent of I/Iperm)
+                            nanidx = nanidxIn{group,side};
                         else
-                            R=ea_corr(thisvals,I(gpatsel,side),obj.corrtype);
+                            thisvals=gval{side}(gpatsel,:);
+                            nanidx = isnan(ea_nansum(thisvals));
+                            thisvals = thisvals(:, ~nanidx);
                         end
+                        thisvalsOut{group,side} = thisvals;
+                        nanidxOut{group,side} = nanidx;
 
-                        vals{group,side}=nan(size(gval{side}(gpatsel,:),2),1);
+                        [R,p]=ea_corr(thisvals,I(gpatsel,side),obj.corrtype);
+
+                        vals{group,side}=nan(numel(nanidx),1);
+                        pvals{group,side}=nan(numel(nanidx),1);
+                        pvals{group,side}(~nanidx)=p;
+
+                        if obj.showsignificantonly && ~skipsigthresh
+                            R=ea_corrsignan(R,p,obj);
+                        end
                         vals{group,side}(~nanidx)=R;
                     case 'Reverse T-Tests (Binary Var)'
 
