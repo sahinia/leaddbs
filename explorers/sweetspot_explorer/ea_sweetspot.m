@@ -57,6 +57,7 @@ classdef ea_sweetspot < handle
         rngseed = 'default';
         Nperm = 1000 % how many permutations in leave-nothing-out permtest strategy
         permtestMaxWorkers = 3 % cap on parallel workers used by permtest/predpermtest's parfor loops. Each worker holds its own full copy of obj (incl. obj.results.efield), so too many workers can exhaust memory on large analyses -- tune per-machine if needed.
+        predpermtestBatchSize = 250 % predpermtest processes permutations in batches of this size (reading from a slim, single-precision companion file via ea_sweetspot_permtest_slim) instead of loading all Nperm rows of Rperm/pperm at once -- lower this further on tighter-memory machines, at the cost of more, smaller disk reads.
         stratifyPermutationsByGroup = 0 % if true, permtest shuffles obj.responsevar only within obj.M.patient.group buckets. Independent of splitbygroup (which is mainly a visualization/coloring setting) -- does not affect or get affected by it.
         kfold = 5 % divide into k sets when doing k-fold CV
         Nsets = 5 % divide into N sets when doing Custom (random) set test
@@ -813,7 +814,21 @@ classdef ea_sweetspot < handle
                 ea_error('sigMode must be ''None'', ''Independent'', or ''Fixed''.');
             end
 
-            train = load(trainPermtestFile);
+            % Rperm/pperm are the memory-heavy part of a saved permtest file
+            % (Nperm x Nvoxels double -- e.g. ~60GB combined across sides at
+            % Nperm=5000 on a ~769K-voxel bilateral grid). Loading them in one
+            % shot via a blanket load() has crashed MATLAB outright on a
+            % 48GB-RAM machine, even in a fresh session with nothing else
+            % running. ea_sweetspot_permtest_slim converts them (once --
+            % cached on disk afterwards, so repeat calls against the same
+            % training file skip straight past this) into flat,
+            % single-precision, top-level per-side variables that support
+            % true row-chunked reads via matfile, processed below in batches
+            % of obj.predpermtestBatchSize permutations so peak memory stays
+            % a small fraction of the full Nperm x Nvoxels size.
+            slimFile = ea_sweetspot_permtest_slim(trainPermtestFile);
+            trainMeta = load(slimFile, 'space', 'Remp', 'pemp', 'Nperm', 'corrtype', 'PermIdx', 'ID');
+            mSlim = matfile(slimFile);
 
             nsides = numel(obj.results.space);
             srcIdx = cell(1, nsides);
@@ -824,12 +839,12 @@ classdef ea_sweetspot < handle
 
             fprintf('Voxel coverage report (training grid vs. this object''s test grid):\n');
             for side = 1:nsides
-                srcIdx{side} = ea_sweetspot_nnindexmap(train.space{side}, obj.results.space{side});
+                srcIdx{side} = ea_sweetspot_nnindexmap(trainMeta.space{side}, obj.results.space{side});
 
                 testTotal(side) = numel(srcIdx{side});
                 testUncovered(side) = sum(isnan(srcIdx{side}));
 
-                trainTotal(side) = numel(train.space{side}.img);
+                trainTotal(side) = numel(trainMeta.space{side}.img);
                 covered = unique(srcIdx{side}(~isnan(srcIdx{side})));
                 trainUncovered(side) = trainTotal(side) - numel(covered);
 
@@ -844,16 +859,16 @@ classdef ea_sweetspot < handle
             else
                 patsel = obj.customselection;
             end
-            Nperm = train.Nperm;
+            Nperm = trainMeta.Nperm;
 
             % Uncorrected significance thresholding (training-grid space, before
             % reprojection -- Remp/pemp and Rperm/pperm share the same voxel
             % indexing, so this is a plain elementwise mask).
             alphalevel = obj.alphalevel;
-            Remp_train = train.Remp(1,:);
+            Remp_train = trainMeta.Remp(1,:);
             if ~strcmp(sigMode, 'None')
                 for side = 1:nsides
-                    nonsig = isnan(train.pemp{1,side}) | train.pemp{1,side} > alphalevel;
+                    nonsig = isnan(trainMeta.pemp{1,side}) | trainMeta.pemp{1,side} > alphalevel;
                     Remp_train{side}(nonsig) = nan;
                 end
             end
@@ -880,56 +895,70 @@ classdef ea_sweetspot < handle
                 empvals{side} = nan(numel(srcIdx{side}), 1);
                 empvals{side}(validMask{side}) = Remp_train{side}(srcIdx{side}(validMask{side}));
             end
-            [Rpredemp, Rpredemp_pval, Ihatemp] = obj.predictfromvals(empvals, patsel, train.corrtype, efieldT);
+            [Rpredemp, Rpredemp_pval, Ihatemp] = obj.predictfromvals(empvals, patsel, trainMeta.corrtype, efieldT);
             if isnan(Rpredemp)
                 ea_error('Empirical out-of-sample prediction is NaN -- cannot rank against the null distribution. Check basepredictionon/posvisible/negvisible settings and voxel coverage.');
             end
+            fprintf('Empirical out-of-sample prediction: Rpredemp = %.4f (parametric p = %.4g).\n', Rpredemp, Rpredemp_pval);
+            fprintf('Check this against your independently-computed empirical R now -- if it does not match, stop here (Ctrl+C) before the %d-permutation null distribution runs.\n', Nperm);
 
-            fprintf('Predicting from %d permuted training maps...\n', Nperm);
+            batchSize = obj.predpermtestBatchSize;
+            fprintf('Predicting from %d permuted training maps, in batches of %d (serial -- no parfor)...\n', Nperm, batchSize);
             Rpredperm = nan(Nperm, 1);
-            obj.capParpool;
+            corrType = trainMeta.corrtype;
 
-            % Pull Rperm/pperm out of the train struct into flat, directly-indexed
-            % matrices before the parfor. train.Rperm{1,side}(p,:) is nested
-            % struct/cell/row indexing, which parfor cannot recognize as a sliced
-            % access -- it would instead broadcast the ENTIRE train struct (incl.
-            % all Nperm rows of Rperm/pperm for both sides, potentially larger
-            % than obj.results.efield since Nperm often exceeds patient count) to
-            % every worker. Rperm1(p,:) below, by contrast, is a plain top-level
-            % matrix indexed directly by the loop variable, which parfor slices
-            % properly -- each worker only receives the rows it actually needs.
-            Rperm1 = train.Rperm{1,1};
-            pperm1 = train.pperm{1,1};
-            if nsides >= 2
-                Rperm2 = train.Rperm{1,2};
-                pperm2 = train.pperm{1,2};
-            else
-                Rperm2 = [];
-                pperm2 = [];
-            end
-            corrType = train.corrtype;
+            % Serial, not parfor: a persistent worker pool driven by dozens of
+            % sequential parfor calls (one per batch) has been observed to
+            % accumulate memory across calls until a worker gets OOM-killed
+            % and the whole pool fails to recover mid-run -- a different,
+            % harder-to-fix failure mode than the original blanket-load()
+            % crash the batching itself solves. Running serially removes the
+            % worker pool from the picture entirely, at the cost of using one
+            % core instead of obj.permtestMaxWorkers.
+            for batchStart = 1:batchSize:Nperm
+                batchIdx = batchStart:min(batchStart+batchSize-1, Nperm);
+                nb = numel(batchIdx);
 
-            parfor p = 1:Nperm
-                permvals = cell(1, nsides);
-                for side = 1:nsides
-                    permvals{side} = nan(numel(srcIdx{side}), 1);
-                    valid = validMask{side};
-                    if side == 1
-                        row = Rperm1(p,:);
-                        prow = pperm1(p,:);
-                    else
-                        row = Rperm2(p,:);
-                        prow = pperm2(p,:);
-                    end
-                    switch sigMode
-                        case 'Independent'
-                            row(isnan(prow) | prow > alphalevel) = nan;
-                        case 'Fixed'
-                            row(~fixedMask{side}) = nan;
-                    end
-                    permvals{side}(valid) = row(srcIdx{side}(valid));
+                % Only this batch's rows ever touch memory -- mSlim.Rperm_sideN
+                % is a plain top-level array (not nested in a cell), so matfile
+                % reads exactly these rows from disk instead of materializing
+                % the full Nperm x Nvoxels array.
+                Rbatch1 = mSlim.Rperm_side1(batchIdx,:);
+                pbatch1 = mSlim.pperm_side1(batchIdx,:);
+                if nsides >= 2
+                    Rbatch2 = mSlim.Rperm_side2(batchIdx,:);
+                    pbatch2 = mSlim.pperm_side2(batchIdx,:);
+                else
+                    Rbatch2 = [];
+                    pbatch2 = [];
                 end
-                Rpredperm(p) = obj.predictfromvals(permvals, patsel, corrType, efieldT);
+
+                RpredBatch = nan(nb, 1);
+                for bi = 1:nb
+                    permvals = cell(1, nsides);
+                    for side = 1:nsides
+                        permvals{side} = nan(numel(srcIdx{side}), 1);
+                        valid = validMask{side};
+                        if side == 1
+                            row = double(Rbatch1(bi,:));
+                            prow = double(pbatch1(bi,:));
+                        else
+                            row = double(Rbatch2(bi,:));
+                            prow = double(pbatch2(bi,:));
+                        end
+                        switch sigMode
+                            case 'Independent'
+                                row(isnan(prow) | prow > alphalevel) = nan;
+                            case 'Fixed'
+                                row(~fixedMask{side}) = nan;
+                        end
+                        permvals{side}(valid) = row(srcIdx{side}(valid));
+                    end
+                    RpredBatch(bi) = obj.predictfromvals(permvals, patsel, corrType, efieldT);
+                end
+                Rpredperm(batchIdx) = RpredBatch;
+
+                fprintf('  Completed permutations %d-%d of %d\n', batchIdx(1), batchIdx(end), Nperm);
             end
 
             % A permutation whose map produced no defined prediction (NaN -- e.g.
@@ -957,11 +986,11 @@ classdef ea_sweetspot < handle
             predresults.exceedCount = exceedCount; % how many (of Nperm) permutations were >= |Rpredemp|; pperm = exceedCount/Nperm
             predresults.pperm = pperm;
             predresults.Rp95 = Rp95;
-            predresults.trainPermIdx = train.PermIdx; % training cohort's shuffle indices (NOT the test cohort -- this object's own patients are never permuted). Columns correspond 1:1 to Rpredperm entries, traceable to the training permtest that produced each permuted map.
+            predresults.trainPermIdx = trainMeta.PermIdx; % training cohort's shuffle indices (NOT the test cohort -- this object's own patients are never permuted). Columns correspond 1:1 to Rpredperm entries, traceable to the training permtest that produced each permuted map.
             predresults.trainPermtestFile = trainPermtestFile;
-            predresults.trainID = train.ID;
+            predresults.trainID = trainMeta.ID;
             predresults.testID = obj.ID;
-            predresults.corrtype = train.corrtype;
+            predresults.corrtype = trainMeta.corrtype;
             predresults.basepredictionon = obj.basepredictionon;
             predresults.sigMode = sigMode;
             predresults.alphalevel = alphalevel;

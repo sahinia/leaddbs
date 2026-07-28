@@ -110,8 +110,13 @@ for gi = 1:size(train.Remp, 1)
             sprintf('Eisenstein 2014 Omnibus Test (%s, \\alpha=%.3g)', tag, alphaEisenstein), 'right');
 
         %% 3. Max-statistic FWER correction (pos/neg separate)
-        maxRperm = ea_nanmax(Rperm, [], 2); % Nperm x 1
-        minRperm = ea_nanmin(Rperm, [], 2); % Nperm x 1
+        % NOTE: ea_nanmax/ea_nanmin (ext_libs/nan) do NOT use MATLAB's own
+        % max(A,[],dim) convention -- their 3-argument form is (a,dim,b) for
+        % an ELEMENTWISE max/min of two same-sized arrays when dim is empty,
+        % not "reduce along dim". The 2-argument form (a,dim) is what reduces
+        % along a dimension.
+        maxRperm = ea_nanmax(Rperm, 2); % Nperm x 1
+        minRperm = ea_nanmin(Rperm, 2); % Nperm x 1
         maxRemp = ea_nanmax(Remp);
         minRemp = ea_nanmin(Remp);
 

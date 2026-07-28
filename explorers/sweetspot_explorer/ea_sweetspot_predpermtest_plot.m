@@ -19,15 +19,22 @@ if ~exist('responselabel', 'var') || isempty(responselabel)
 end
 
 % Figure 1: empirical Ihat vs. the test cohort's real, unpermuted responsevar.
-h1 = ea_corrbox(pred.Iemp, pred.Ihatemp, pred.pperm, ...
-    {sprintf('Out-of-Sample Prediction (%s)', pred.testID), responselabel, 'Predicted Score (Ihat)'});
-try % ea_corrbox is a shared, gramm-based utility -- best-effort cleanup, non-fatal if its internal structure doesn't cooperate
-    set(h1, 'Color', 'w');
-    axesInH1 = findall(h1, 'Type', 'axes');
-    for a = 1:numel(axesInH1)
-        set(axesInH1(a), 'Color', 'w');
-        box(axesInH1(a), 'off');
+% Iemp/Ihatemp were only added to predpermtest's saved output recently -- older
+% files won't have them. Skip this figure rather than erroring the whole
+% function, since Figure 2 below doesn't depend on either field.
+if isfield(pred, 'Iemp') && isfield(pred, 'Ihatemp')
+    h1 = ea_corrbox(pred.Iemp, pred.Ihatemp, pred.pperm, ...
+        {sprintf('Out-of-Sample Prediction (%s)', pred.testID), responselabel, 'Predicted Score (Ihat)'});
+    try % ea_corrbox is a shared, gramm-based utility -- best-effort cleanup, non-fatal if its internal structure doesn't cooperate
+        set(h1, 'Color', 'w');
+        axesInH1 = findall(h1, 'Type', 'axes');
+        for a = 1:numel(axesInH1)
+            set(axesInH1(a), 'Color', 'w');
+            box(axesInH1(a), 'off');
+        end
     end
+else
+    warning('This predpermtest.mat file was saved before Iemp/Ihatemp were added -- skipping the correlation scatter (Figure 1). Rerun predpermtest to regenerate a file with this figure available. Showing the null-distribution plot (Figure 2) only.');
 end
 
 % Figure 2: null distribution of out-of-sample R, empirical R marked, rank annotated.
