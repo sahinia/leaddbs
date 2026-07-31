@@ -21,6 +21,16 @@ function [Iperm, PermIdx] = ea_shuffle_grouped(I, Nperm, Sel, group, rngseed)
 % PermIdx  - Npatients x Nperm, the patient-index mapping used for each
 %            permutation (Iperm(:,p) == I(PermIdx(:,p))), saved for
 %            reproducibility/auditing.
+%
+% Each new shuffle is checked against every previously accepted one and
+% redrawn on a match, so all Nperm columns of PermIdx are guaranteed
+% distinct (matches PALM's default Monte Carlo permutation behavior,
+% which does the same unless run with -cmcp). In practice this rarely
+% changes anything: with realistic patient counts, the total number of
+% possible shuffles vastly exceeds any typical Nperm, so collisions are
+% already vanishingly unlikely -- this just makes that guarantee exact
+% rather than probabilistic, and only costs a redraw in the rare case it's
+% needed.
 
 if size(I,2) > 1
     error('ea_shuffle_grouped:hemiscore', 'Hemiscore responsevar (2 columns) is not yet supported for permutation testing.');
@@ -49,12 +59,33 @@ Iperm = repmat(I, 1, Nperm);
 
 groups = unique(group(Sel));
 
+maxAttempts = 1000; % redraw-on-duplicate cap; only matters if the shuffle pool is small relative to Nperm
+warnedDuplicateLimit = false;
+
 for p = 1:Nperm
-    idx = (1:Npatients)';
-    for g = groups'
-        pool = Sel(group(Sel)==g & ~isnan(I(Sel)));
-        if numel(pool) > 1
-            idx(pool) = pool(randperm(numel(pool)));
+    attempt = 0;
+    while true
+        idx = (1:Npatients)';
+        for g = groups'
+            pool = Sel(group(Sel)==g & ~isnan(I(Sel)));
+            if numel(pool) > 1
+                idx(pool) = pool(randperm(numel(pool)));
+            end
+        end
+        attempt = attempt + 1;
+        if p == 1 || ~any(all(idx == PermIdx(:,1:p-1), 1))
+            break % unique among all previously accepted shuffles (or nothing to compare against yet)
+        end
+        if attempt >= maxAttempts
+            if ~warnedDuplicateLimit
+                warning('ea_shuffle_grouped:duplicateLimit', ...
+                    ['Could not find a new, not-yet-used shuffle within %d attempts ', ...
+                    '(permutation %d/%d) -- the shuffle pool may be small relative to Nperm. ', ...
+                    'Accepting a duplicate here and suppressing this warning for the rest of this call.'], ...
+                    maxAttempts, p, Nperm);
+                warnedDuplicateLimit = true;
+            end
+            break
         end
     end
     PermIdx(:,p) = idx;

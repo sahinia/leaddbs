@@ -118,7 +118,8 @@ for group=groups
                 case 'E-Fields'
                     gval{side}(gval{side}<=obj.efieldthreshold) = nan;
                     Nmap=ea_nansum(gval{side}(gpatsel,:)>obj.efieldthreshold);
-                    gval{side}(gpatsel,Nmap<round(length(gpatsel)*(obj.coverthreshold/100)))=nan; % Set pixels to Nan that do not meet coverthreshold criteria
+                    nthreshold = round(length(gpatsel)*(obj.coverthreshold/100));
+                    gval{side}(gpatsel,Nmap<nthreshold)=nan; % Set pixels to Nan that do not meet coverthreshold criteria
             end
         end
         gvalOut{group,side} = gval{side};
