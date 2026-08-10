@@ -472,12 +472,12 @@ classdef ea_sweetspot < handle
 
             [Iperm, PermIdx] = ea_shuffle_grouped(obj.responsevar, Nperm, patsel, groupvec, obj.rngseed);
 
-            outdir = [fileparts(obj.leadgroup), filesep, 'sweetspots', filesep];
-            ea_mkdir(outdir);
-
-            % Descriptive base filename shared by this run's nifti exports and its
-            % saved .mat -- encodes the options that most affect the result, plus a
-            % timestamp so repeated runs never silently collide/overwrite each other.
+            % Descriptive base filename, also used as this run's dedicated folder
+            % name -- encodes the options that most affect the result, plus a
+            % timestamp so repeated runs never silently collide/overwrite each
+            % other. Every output this run produces (the saved .mat, nifti
+            % exports, README) lives together in sweetspots/<basefname>/, not
+            % flat alongside every other run's files.
             if obj.stratifyPermutationsByGroup
                 stratTag = 'stratified';
             else
@@ -489,6 +489,14 @@ classdef ea_sweetspot < handle
                 mirrorTag = 'nonmirrored';
             end
             basefname = sprintf('%s_permtest_N%d_%s_%s_%s_%s', obj.ID, Nperm, stratTag, mirrorTag, corrType, datestr(now, 'yyyymmdd_HHMMSS'));
+
+            outdir = [fileparts(obj.leadgroup), filesep, 'sweetspots', filesep, basefname, filesep];
+            suffix = 1;
+            while exist(outdir, 'dir') % timestamp makes this vanishingly rare, but never silently merge into an existing run's folder
+                suffix = suffix + 1;
+                outdir = [fileparts(obj.leadgroup), filesep, 'sweetspots', filesep, basefname, '_', num2str(suffix), filesep];
+            end
+            ea_mkdir(outdir);
 
             fprintf('Calculating empirical (unpermuted) sweetspot map...\n');
             [Remp, pemp, gvalFixed, gpatselFixed, thisvalsFixed, nanidxFixed] = ea_sweetspot_calcstats(obj, patsel, obj.responsevar, true); % skipsigthresh=true: always store raw, unmasked values
@@ -510,39 +518,119 @@ classdef ea_sweetspot < handle
 
             obj.capParpool;
 
-            Rrow = cell(1, Nperm);
-            prow = cell(1, Nperm);
+            % ngroups/nsides are already knowable from Remp -- computed here,
+            % before the parfor loop, so the loop itself can write directly
+            % into its final, flat, single-precision form for the common
+            % (single-group) case, rather than collecting every permutation's
+            % full double-precision result into an Rrow/prow cell array first.
+            % That intermediate held EVERY permutation's full result in memory
+            % AT ONCE, in double precision, the moment the parfor loop
+            % finished -- there is no way to reduce that after the fact by
+            % clearing pieces of it sooner, since it's already fully built by
+            % then. At Nperm=5000 on a real analysis this was ~123GB by
+            % itself, which is what actually pushed a real run to ~180GB even
+            % after adding row-by-row clearing (a real, but insufficient,
+            % previous fix). Writing directly into preallocated
+            % single-precision sliced parfor outputs avoids that intermediate
+            % ever existing at all.
+            ngroups = size(Remp,1);
+            nsides = size(Remp,2);
 
             progress = 0;
             dq = parallel.pool.DataQueue;
             afterEach(dq, @(~) reportProgress());
 
             fprintf('Running %d permutations...\n', Nperm);
-            parfor p = 1:Nperm
-                [v, pv] = ea_sweetspot_calcstats(obj, patsel, Iperm(:,p), true, gvalFixed, gpatselFixed, thisvalsFixed, nanidxFixed);
-                Rrow{p} = v;
-                prow{p} = pv;
-                send(dq, 1);
-            end
-
-            Rperm = cell(size(Remp));
-            pperm = cell(size(Remp));
-            for gi = 1:numel(Remp)
-                if isempty(Remp{gi})
-                    continue
-                end
-                Rperm{gi} = nan(Nperm, numel(Remp{gi}));
-                pperm{gi} = nan(Nperm, numel(Remp{gi}));
-                for p = 1:Nperm
-                    Rperm{gi}(p,:) = Rrow{p}{gi}';
-                    pperm{gi}(p,:) = prow{p}{gi}';
-                end
-            end
 
             permresults.Remp = Remp;
             permresults.pemp = pemp;
-            permresults.Rperm = Rperm;
-            permresults.pperm = pperm;
+
+            if ngroups == 1
+                % Fast path: flat, single-precision, top-level per-side
+                % variables -- supports true row-chunked matfile() reads
+                % downstream (predpermtest, ea_sweetspot_permtest_stats),
+                % unlike a Rperm{side} cell of double arrays, which
+                % matfile() can only load in full per element. This is the
+                % layout ea_sweetspot_permtest_slim used to have to produce
+                % as a separate, crash-prone conversion step; writing it
+                % directly here, from the parfor loop itself, skips that
+                % conversion, and its crash risk, entirely. See the
+                % short-circuit at the top of ea_sweetspot_permtest_slim.m.
+                %
+                % Rperm_side1/2 (etc.) are "sliced" parfor output variables:
+                % preallocated before the loop, each worker writes only its
+                % own row (Rperm_side1(p,:) = ...), and MATLAB ships back
+                % just that row rather than requiring the whole array to be
+                % reconstructed from a cell of per-permutation pieces
+                % afterward.
+                Rperm_side1 = nan(Nperm, numel(Remp{1,1}), 'single');
+                pperm_side1 = nan(Nperm, numel(Remp{1,1}), 'single');
+                if nsides == 2
+                    Rperm_side2 = nan(Nperm, numel(Remp{1,2}), 'single');
+                    pperm_side2 = nan(Nperm, numel(Remp{1,2}), 'single');
+                    parfor p = 1:Nperm
+                        [v, pv] = ea_sweetspot_calcstats(obj, patsel, Iperm(:,p), true, gvalFixed, gpatselFixed, thisvalsFixed, nanidxFixed);
+                        Rperm_side1(p,:) = single(v{1}');
+                        pperm_side1(p,:) = single(pv{1}');
+                        Rperm_side2(p,:) = single(v{2}');
+                        pperm_side2(p,:) = single(pv{2}');
+                        send(dq, 1);
+                    end
+                    permresults.Rperm_side2 = Rperm_side2;
+                    permresults.pperm_side2 = pperm_side2;
+                    clear Rperm_side2 pperm_side2
+                else
+                    parfor p = 1:Nperm
+                        [v, pv] = ea_sweetspot_calcstats(obj, patsel, Iperm(:,p), true, gvalFixed, gpatselFixed, thisvalsFixed, nanidxFixed);
+                        Rperm_side1(p,:) = single(v{1}');
+                        pperm_side1(p,:) = single(pv{1}');
+                        send(dq, 1);
+                    end
+                end
+                permresults.Rperm_side1 = Rperm_side1;
+                permresults.pperm_side1 = pperm_side1;
+                clear Rperm_side1 pperm_side1
+            else
+                % Multiple groups (obj.splitbygroup): the fast flat layout
+                % above -- and everything downstream that reads it
+                % (predpermtest, ea_sweetspot_permtest_slim) -- has never
+                % supported more than group 1, so this rarer path keeps
+                % collecting every permutation's full {group,side} result via
+                % Rrow/prow first, then reshaping into the original nested
+                % {group,side} double-cell layout, unchanged -- preallocating
+                % per-group/side sliced outputs the same way as above isn't
+                % worth the complexity for this already-slower legacy path.
+                % Each Rrow{p}{gi}/prow{p}{gi} is still freed as soon as it's
+                % copied out below, to at least avoid holding it twice over.
+                Rrow = cell(1, Nperm);
+                prow = cell(1, Nperm);
+                parfor p = 1:Nperm
+                    [v, pv] = ea_sweetspot_calcstats(obj, patsel, Iperm(:,p), true, gvalFixed, gpatselFixed, thisvalsFixed, nanidxFixed);
+                    Rrow{p} = v;
+                    prow{p} = pv;
+                    send(dq, 1);
+                end
+
+                Rperm = cell(size(Remp));
+                pperm = cell(size(Remp));
+                for gi = 1:numel(Remp)
+                    if isempty(Remp{gi})
+                        continue
+                    end
+                    Rperm{gi} = nan(Nperm, numel(Remp{gi}));
+                    pperm{gi} = nan(Nperm, numel(Remp{gi}));
+                    for p = 1:Nperm
+                        Rperm{gi}(p,:) = Rrow{p}{gi}';
+                        pperm{gi}(p,:) = prow{p}{gi}';
+                        Rrow{p}{gi} = [];
+                        prow{p}{gi} = [];
+                    end
+                end
+                permresults.Rperm = Rperm;
+                permresults.pperm = pperm;
+                clear Rrow prow
+            end
+
             permresults.PermIdx = PermIdx;
             permresults.Nperm = Nperm;
             permresults.rngseed = obj.rngseed;
@@ -559,15 +647,41 @@ classdef ea_sweetspot < handle
             permresults.ID = obj.ID;
             permresults.leadgroup = obj.leadgroup;
 
+            % outdir is a freshly-created, just-uniquified folder (see above) --
+            % nothing else could already have a file here, so no filename
+            % collision check is needed at this level (unlike outdir itself).
             outfile = [outdir, basefname, '.mat'];
-            suffix = 1;
-            while exist(outfile, 'file') % timestamp makes this vanishingly rare, but never silently overwrite
-                suffix = suffix + 1;
-                outfile = [outdir, basefname, '_', num2str(suffix), '.mat'];
-            end
             permresults.savedfile = outfile;
             save(outfile, '-struct', 'permresults', '-v7.3');
             fprintf('Saved permutation results to %s\n', outfile);
+
+            readmeBody = sprintf([ ...
+                'Voxelwise permutation test of the sweetspot correlation map for %s.\n\n', ...
+                'Settings used for this run:\n', ...
+                '  Nperm                      = %d\n', ...
+                '  corrType                   = %s\n', ...
+                '  stratifyPermutationsByGroup = %d\n', ...
+                '  mirrorsides                = %d\n', ...
+                '  statlevel                  = %s\n', ...
+                '  stattest                   = %s\n', ...
+                '  coverthreshold             = %g%%\n', ...
+                '  efieldthreshold            = %g\n', ...
+                '  rngseed                    = %s\n\n', ...
+                'Files in this folder:\n', ...
+                '  %s.mat  - Remp/pemp (empirical R/p per voxel) and Rperm/pperm\n', ...
+                '                 (null distributions -- flat, single-precision, chunk-readable\n', ...
+                '                 for the common single-group case; see ea_sweetspot_permtest_slim\n', ...
+                '                 for the legacy/multi-group nested-cell format), plus PermIdx\n', ...
+                '                 (the exact patient-shuffle used per permutation) and the settings\n', ...
+                '                 block above.\n', ...
+                '  *_Remp_group*.nii - the empirical (real, unpermuted) correlation map, UNMASKED\n', ...
+                '                 (raw R everywhere, no significance thresholding applied yet --\n', ...
+                '                 that happens in a separate post-hoc step, see\n', ...
+                '                 ea_sweetspot_permtest_stats, which adds its own files/section to\n', ...
+                '                 this same folder/README once run).\n'], ...
+                obj.ID, Nperm, corrType, obj.stratifyPermutationsByGroup, obj.mirrorsides, obj.statlevel, ...
+                obj.stattest, obj.coverthreshold, obj.efieldthreshold, obj.rngseed, basefname);
+            ea_sweetspot_readme_append(outdir, 'Voxelwise permutation test (permtest)', readmeBody);
 
             function reportProgress()
                 % Called on the client (not inside the workers) each time a
@@ -782,7 +896,7 @@ classdef ea_sweetspot < handle
             end
         end
 
-        function predresults = predpermtest(obj, trainPermtestFile, sigMode)
+        function predresults = predpermtest(obj, trainPermtestFile, sigMode, tail)
             % Out-of-sample validation of a voxelwise permutation test (built
             % via permtest() on a *different*, training ea_sweetspot object)
             % against this (test) object's own, never-permuted patient
@@ -802,6 +916,14 @@ classdef ea_sweetspot < handle
             %                   thresholded using its own p-values
             %   'Fixed'       - the empirical map's significant-voxel mask is
             %                   computed once and applied to every permutation
+            %
+            % tail controls which direction(s) of the null distribution count
+            % as "as extreme as" the empirical prediction, for exceedCount/pperm:
+            %   'right' (default) - Rpredperm >= Rpredemp (a hypothesis that
+            %                       the map should only ever predict IMPROVEMENT)
+            %   'left'             - Rpredperm <= Rpredemp
+            %   'both'             - abs(Rpredperm) >= abs(Rpredemp); this
+            %                        function's only behavior before tail existed
 
             if size(obj.responsevar, 2) > 1
                 ea_error('Hemiscore responsevar (2 columns) is not yet supported for permutation testing.');
@@ -812,6 +934,13 @@ classdef ea_sweetspot < handle
             end
             if ~ismember(sigMode, {'None', 'Independent', 'Fixed'})
                 ea_error('sigMode must be ''None'', ''Independent'', or ''Fixed''.');
+            end
+
+            if ~exist('tail', 'var') || isempty(tail)
+                tail = 'right';
+            end
+            if ~ismember(tail, {'right', 'left', 'both'})
+                ea_error('tail must be ''right'', ''left'', or ''both''.');
             end
 
             % Rperm/pperm are the memory-heavy part of a saved permtest file
@@ -969,12 +1098,19 @@ classdef ea_sweetspot < handle
             % MATLAB, which already gives this behavior -- made explicit here
             % rather than left implicit, and reported instead of silent).
             nNaNperm = sum(isnan(Rpredperm));
-            exceedCount = sum(abs(Rpredperm) >= abs(Rpredemp));
-            Rp0 = sort(abs(Rpredperm), 'descend'); % NaNs sort to the end automatically
+            switch tail
+                case 'right'
+                    exceedCount = sum(Rpredperm >= Rpredemp);
+                case 'left'
+                    exceedCount = sum(Rpredperm <= Rpredemp);
+                case 'both'
+                    exceedCount = sum(abs(Rpredperm) >= abs(Rpredemp));
+            end
+            Rp0 = sort(abs(Rpredperm), 'descend'); % NaNs sort to the end automatically; unaffected by tail, always the two-tailed 95th-percentile diagnostic
             Rp95 = Rp0(round(0.05*Nperm));
             pperm = exceedCount / Nperm;
             fprintf('%d/%d permutations (%.1f%%) produced no defined prediction (NaN) -- counted as not exceeding the empirical result.\n', nNaNperm, Nperm, 100*nNaNperm/Nperm);
-            disp(['Out-of-sample permuted p = ', sprintf('%0.3f', pperm), ' (empirical R ranks ', num2str(exceedCount), ' of ', num2str(Nperm), ').']);
+            disp(['Out-of-sample permuted p (tail=''', tail, ''') = ', sprintf('%0.3f', pperm), ' (empirical R ranks ', num2str(exceedCount), ' of ', num2str(Nperm), ').']);
 
             predresults.Rpredemp = Rpredemp;
             predresults.Rpredemp_pval = Rpredemp_pval; % parametric p-value of the empirical correlation itself (distinct from pperm, the permutation-based null p-value)
@@ -983,8 +1119,9 @@ classdef ea_sweetspot < handle
             predresults.responsevarlabel = obj.responsevarlabel;
             predresults.Rpredperm = Rpredperm;
             predresults.nNaNperm = nNaNperm; % permutations with no defined prediction, counted as not exceeding Rpredemp (see pperm)
-            predresults.exceedCount = exceedCount; % how many (of Nperm) permutations were >= |Rpredemp|; pperm = exceedCount/Nperm
+            predresults.exceedCount = exceedCount; % how many (of Nperm) permutations were as extreme as Rpredemp per `tail`; pperm = exceedCount/Nperm
             predresults.pperm = pperm;
+            predresults.tail = tail;
             predresults.Rp95 = Rp95;
             predresults.trainPermIdx = trainMeta.PermIdx; % training cohort's shuffle indices (NOT the test cohort -- this object's own patients are never permuted). Columns correspond 1:1 to Rpredperm entries, traceable to the training permtest that produced each permuted map.
             predresults.trainPermtestFile = trainPermtestFile;
@@ -999,24 +1136,46 @@ classdef ea_sweetspot < handle
             predresults.trainUncoveredVoxels = trainUncovered;
             predresults.trainTotalVoxels = trainTotal;
 
-            outdir = [fileparts(obj.leadgroup), filesep, 'sweetspots', filesep];
-            ea_mkdir(outdir);
-
-            % Filename identifies which training run this test cohort was checked
-            % against (a test cohort may be validated against several different
-            % training analyses for different purposes -- each gets its own file
-            % instead of overwriting the last one), plus sigMode and a timestamp.
+            % Basefname (also used as this run's dedicated folder name) identifies
+            % which training run this test cohort was checked against (a test
+            % cohort may be validated against several different training analyses
+            % for different purposes -- each gets its own folder instead of
+            % overwriting the last one), plus sigMode and a timestamp.
             [~, trainBaseName] = fileparts(trainPermtestFile);
             basefname = sprintf('%s_predpermtest_vs_%s_%s_%s', obj.ID, trainBaseName, sigMode, datestr(now, 'yyyymmdd_HHMMSS'));
-            outfile = [outdir, basefname, '.mat'];
+
+            outdir = [fileparts(obj.leadgroup), filesep, 'sweetspots', filesep, basefname, filesep];
             suffix = 1;
-            while exist(outfile, 'file') % timestamp makes this vanishingly rare, but never silently overwrite
+            while exist(outdir, 'dir') % timestamp makes this vanishingly rare, but never silently merge into an existing run's folder
                 suffix = suffix + 1;
-                outfile = [outdir, basefname, '_', num2str(suffix), '.mat'];
+                outdir = [fileparts(obj.leadgroup), filesep, 'sweetspots', filesep, basefname, '_', num2str(suffix), filesep];
             end
+            ea_mkdir(outdir);
+
+            % outdir is a freshly-created, just-uniquified folder -- nothing else
+            % could already have a file here, so no filename collision check is
+            % needed at this level (unlike outdir itself, above).
+            outfile = [outdir, basefname, '.mat'];
             predresults.savedfile = outfile;
             save(outfile, '-struct', 'predresults', '-v7.3');
             fprintf('Saved out-of-sample permutation prediction results to %s\n', outfile);
+
+            readmeBody = sprintf([ ...
+                'Out-of-sample validation of training permtest file:\n  %s\nagainst this (test) object''s (%s) own, never-permuted patient scores.\n\n', ...
+                'Settings used for this run:\n', ...
+                '  sigMode  = %s\n', ...
+                '  tail     = %s\n', ...
+                '  alphalevel = %g\n', ...
+                '  basepredictionon = %s\n\n', ...
+                'Result: Rpredemp = %.4f (parametric p = %.4g); out-of-sample permuted p = %.3f\n', ...
+                '(empirical R ranks %d of %d permutations).\n\n', ...
+                'Files in this folder:\n', ...
+                '  %s.mat  - Rpredemp/Rpredperm (empirical + null out-of-sample predictions),\n', ...
+                '                 Ihatemp/Iemp (per-patient predicted vs. real scores), and the\n', ...
+                '                 settings/result summary above.\n'], ...
+                trainPermtestFile, obj.ID, sigMode, tail, alphalevel, obj.basepredictionon, ...
+                Rpredemp, Rpredemp_pval, pperm, exceedCount, Nperm, basefname);
+            ea_sweetspot_readme_append(outdir, 'Out-of-sample prediction (predpermtest)', readmeBody);
 
             ea_sweetspot_predpermtest_plot(outfile); % shared with standalone re-plotting from a saved file
         end

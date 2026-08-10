@@ -1,4 +1,4 @@
-function results = ea_sweetspot_permtest_stats(permtestFile, alphaVoxelwise, alphaEisenstein, alphaMaxstat, useTailApprox)
+function results = ea_sweetspot_permtest_stats(permtestFile, alphaVoxelwise, alphaEisenstein, alphaMaxstat, useTailApprox, batchSize)
 % Reads a <ID>_permtest.mat file (produced by ea_sweetspot's permtest method)
 % and computes three complementary permutation-based significance analyses,
 % entirely standalone -- only the file path and explicit alpha levels are
@@ -28,6 +28,11 @@ function results = ea_sweetspot_permtest_stats(permtestFile, alphaVoxelwise, alp
 %                    1/(Nperm+1) permutation-count floor when the null's
 %                    tail actually fits a GPD well. Default false (matches
 %                    prior behavior exactly).
+% batchSize       - for group 1 (see below), Rperm/pperm are read off disk
+%                    in row batches of this many permutations at a time
+%                    rather than loaded whole. Default 250; lower it
+%                    further on tighter-memory machines, at the cost of
+%                    more, smaller disk reads.
 %
 % Positive ("sweet spot") and negative ("sour spot") directions are tracked
 % and thresholded separately throughout, rather than folded into |R|.
@@ -52,8 +57,29 @@ end
 if ~exist('useTailApprox', 'var') || isempty(useTailApprox)
     useTailApprox = false;
 end
+if ~exist('batchSize', 'var') || isempty(batchSize)
+    batchSize = 250;
+end
 
-train = load(permtestFile);
+% Dot-free string forms of the alpha values for use in exported FILENAMES
+% only (results.alphaVoxelwise/alphaMaxstat above keep the real numeric
+% value) -- ea_write_nii's ea_stripext call treats the FIRST '.' anywhere
+% in a filename as an extension boundary, not just the one before '.nii',
+% so a name like '..._maxstat_p0.05_group1.nii' silently gets written to
+% disk as '..._maxstat_p0.nii' (losing the '05_group1' part entirely, and
+% colliding with any other export whose name also truncates to the same
+% thing -- e.g. a different group, or a different alpha). Stripping the
+% dot instead of embedding it sidesteps that entirely.
+alphaVoxelwiseStr = strrep(sprintf('%.3g', alphaVoxelwise), '.', '');
+alphaMaxstatStr = strrep(sprintf('%.3g', alphaMaxstat), '.', '');
+
+% Only the small variables (Nvoxels x 1 or smaller) are loaded whole here.
+% Rperm/pperm (Nperm x Nvoxels per side) are the memory-heavy part of a
+% saved permtest file and are read separately, in row-chunked batches, via
+% ea_sweetspot_permtest_slim + matfile() below -- a blanket load() of
+% those used to push MATLAB to ~159GB and effectively hang the machine on
+% large (high-Nperm, high-resolution) runs.
+train = load(permtestFile, 'space', 'Remp', 'pemp', 'Nperm');
 outdir = [fileparts(permtestFile), filesep];
 [~, basefname] = fileparts(permtestFile);
 
@@ -65,6 +91,20 @@ results.alphaMaxstat = alphaMaxstat;
 results.useTailApprox = useTailApprox;
 
 nsides = numel(train.space);
+Nperm = train.Nperm;
+
+% Group 1 is always readable this way: permtest() now saves it directly in
+% this flat, single-precision, chunk-readable layout; ea_sweetspot_permtest_slim
+% converts an older/legacy file to match, or passes an already-flat one
+% through unchanged (see that function). Groups beyond 1 (obj.splitbygroup)
+% have never been supported by this flat layout -- trainHeavy, loaded lazily
+% only if a group > 1 is actually encountered below, keeps that rare path
+% working exactly as before.
+slimFile = ea_sweetspot_permtest_slim(permtestFile);
+mTrain = matfile(slimFile);
+trainHeavy = [];
+
+summaryLines = {}; % one line per group/side, appended to this run's README at the end
 
 for gi = 1:size(train.Remp, 1)
     if all(cellfun(@isempty, train.Remp(gi,:)))
@@ -77,16 +117,63 @@ for gi = 1:size(train.Remp, 1)
     for side = 1:nsides
         Remp = train.Remp{gi,side};   % Nvoxels x 1
         pemp = train.pemp{gi,side};   % Nvoxels x 1
-        Rperm = train.Rperm{gi,side}; % Nperm x Nvoxels
-        pperm = train.pperm{gi,side}; % Nperm x Nvoxels
-        Nperm = train.Nperm;
 
         tag = sprintf('group%d side%d', gi, side);
 
-        %% 1. Voxelwise uncorrected permutation threshold (per-voxel own null, pos/neg separate)
+        %% 1+3 setup: accumulate the per-voxel exceedance counts (#1) and the
+        % per-permutation Eisenstein Q / max / min (#2, #3) in row batches,
+        % rather than ever holding the full Nperm x Nvoxels Rperm/pperm in
+        % memory at once.
         RempRow = Remp'; % 1 x Nvoxels, for broadcasting against Rperm's rows
-        countPos = sum(Rperm >= RempRow, 1);
-        countNeg = sum(Rperm <= RempRow, 1);
+        countPos = zeros(1, numel(Remp));
+        countNeg = zeros(1, numel(Remp));
+        Qperm = nan(Nperm, 1);
+        maxRperm = nan(Nperm, 1);
+        minRperm = nan(Nperm, 1);
+
+        if gi == 1
+            for batchStart = 1:batchSize:Nperm
+                batchIdx = batchStart:min(batchStart+batchSize-1, Nperm);
+                Rbatch = double(mTrain.(sprintf('Rperm_side%d', side))(batchIdx,:));
+                pbatch = double(mTrain.(sprintf('pperm_side%d', side))(batchIdx,:));
+
+                countPos = countPos + sum(Rbatch >= RempRow, 1);
+                countNeg = countNeg + sum(Rbatch <= RempRow, 1);
+
+                sigMaskBatch = pbatch <= alphaEisenstein;
+                logpBatch = -log10(max(pbatch, eps));
+                logpBatch(~sigMaskBatch) = 0;
+                Qperm(batchIdx) = ea_nansum(logpBatch, 2);
+
+                % NOTE: ea_nanmax/ea_nanmin (ext_libs/nan) do NOT use MATLAB's
+                % own max(A,[],dim) convention -- their 3-argument form is
+                % (a,dim,b) for an ELEMENTWISE max/min of two same-sized
+                % arrays when dim is empty, not "reduce along dim". The
+                % 2-argument form (a,dim) is what reduces along a dimension.
+                maxRperm(batchIdx) = ea_nanmax(Rbatch, 2);
+                minRperm(batchIdx) = ea_nanmin(Rbatch, 2);
+            end
+        else
+            % Rare multi-group path -- Rperm/pperm only exist in the
+            % original nested-cell, double-precision form for group > 1.
+            if isempty(trainHeavy)
+                trainHeavy = load(permtestFile, 'Rperm', 'pperm');
+            end
+            Rperm = trainHeavy.Rperm{gi,side};
+            pperm = trainHeavy.pperm{gi,side};
+
+            countPos = sum(Rperm >= RempRow, 1);
+            countNeg = sum(Rperm <= RempRow, 1);
+
+            sigMaskPerm = pperm <= alphaEisenstein;
+            logpPerm = -log10(max(pperm, eps));
+            logpPerm(~sigMaskPerm) = 0;
+            Qperm = ea_nansum(logpPerm, 2);
+
+            maxRperm = ea_nanmax(Rperm, 2);
+            minRperm = ea_nanmin(Rperm, 2);
+        end
+
         % +1 in numerator and denominator: the empirical map is itself one
         % valid draw under the null, so it belongs in its own reference set.
         % Without it, a voxel with zero exceedances would report p = 0,
@@ -115,11 +202,6 @@ for gi = 1:size(train.Remp, 1)
         logpEmp(~sigMaskEmp) = 0;
         Qemp = ea_nansum(logpEmp);
 
-        sigMaskPerm = pperm <= alphaEisenstein;
-        logpPerm = -log10(max(pperm, eps));
-        logpPerm(~sigMaskPerm) = 0;
-        Qperm = ea_nansum(logpPerm, 2); % Nperm x 1
-
         results.eisenstein.Qemp{gi,side} = Qemp;
         results.eisenstein.Qperm{gi,side} = Qperm;
 
@@ -128,13 +210,6 @@ for gi = 1:size(train.Remp, 1)
             sprintf('Eisenstein 2014 Omnibus Test (%s, \\alpha=%.3g)', tag, alphaEisenstein), 'right', useTailApprox);
 
         %% 3. Max-statistic FWER correction (pos/neg separate)
-        % NOTE: ea_nanmax/ea_nanmin (ext_libs/nan) do NOT use MATLAB's own
-        % max(A,[],dim) convention -- their 3-argument form is (a,dim,b) for
-        % an ELEMENTWISE max/min of two same-sized arrays when dim is empty,
-        % not "reduce along dim". The 2-argument form (a,dim) is what reduces
-        % along a dimension.
-        maxRperm = ea_nanmax(Rperm, 2); % Nperm x 1
-        minRperm = ea_nanmin(Rperm, 2); % Nperm x 1
         maxRemp = ea_nanmax(Remp);
         minRemp = ea_nanmin(Remp);
 
@@ -167,11 +242,30 @@ for gi = 1:size(train.Remp, 1)
         fprintf('%s: voxelwise %d/%d pos + %d/%d neg voxels survive p<=%.3g | Eisenstein Q p=%.3g | max-stat pos p=%.3g, neg p=%.3g\n', ...
             tag, sum(voxSurvivePos), numel(voxSurvivePos), sum(voxSurviveNeg), numel(voxSurviveNeg), alphaVoxelwise, ...
             results.eisenstein.p{gi,side}, results.maxstat.pPos{gi,side}, results.maxstat.pNeg{gi,side});
+
+        summaryLines{end+1} = sprintf('%s: voxelwise %d/%d pos + %d/%d neg voxels survive p<=%.3g | Eisenstein Q p=%.3g | max-stat pos p=%.3g, neg p=%.3g', ...
+            tag, sum(voxSurvivePos), numel(voxSurvivePos), sum(voxSurviveNeg), numel(voxSurviveNeg), alphaVoxelwise, ...
+            results.eisenstein.p{gi,side}, results.maxstat.pPos{gi,side}, results.maxstat.pNeg{gi,side}); %#ok<AGROW>
     end
 
-    ea_sweetspot_vals2nii(train.space, voxThreshMap, outdir, sprintf('%s_voxelwise_p%.3g_group%d', basefname, alphaVoxelwise, gi));
-    ea_sweetspot_vals2nii(train.space, maxstatMap, outdir, sprintf('%s_maxstat_p%.3g_group%d', basefname, alphaMaxstat, gi));
+    ea_sweetspot_vals2nii(train.space, voxThreshMap, outdir, sprintf('%s_voxelwise_p%s_group%d', basefname, alphaVoxelwiseStr, gi));
+    ea_sweetspot_vals2nii(train.space, maxstatMap, outdir, sprintf('%s_maxstat_p%s_group%d', basefname, alphaMaxstatStr, gi));
 end
+
+readmeBody = sprintf([ ...
+    'Post-hoc significance analysis of %s.\n\n', ...
+    'Settings used for this run:\n', ...
+    '  alphaVoxelwise  = %g\n', ...
+    '  alphaEisenstein = %g\n', ...
+    '  alphaMaxstat    = %g\n', ...
+    '  useTailApprox   = %d\n\n', ...
+    'Results:\n  %s\n\n', ...
+    'Files added to this folder:\n', ...
+    '  %s_voxelwise_p%s_group*.nii - per-voxel uncorrected permutation threshold, pos/neg\n', ...
+    '  %s_maxstat_p%s_group*.nii   - max-statistic FWER-corrected threshold, pos/neg\n'], ...
+    basefname, alphaVoxelwise, alphaEisenstein, alphaMaxstat, useTailApprox, ...
+    strjoin(summaryLines, sprintf('\n  ')), basefname, alphaVoxelwiseStr, basefname, alphaMaxstatStr);
+ea_sweetspot_readme_append(outdir, 'Post-hoc significance analysis (ea_sweetspot_permtest_stats)', readmeBody);
 end
 
 function thresh = ea_sweetspot_exact_maxstat_threshold(nullvals, alpha, tail)

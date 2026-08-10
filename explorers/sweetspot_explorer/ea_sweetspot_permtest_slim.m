@@ -24,10 +24,25 @@ function slimFile = ea_sweetspot_permtest_slim(permtestFile, slimFile)
 % Skips the conversion (returns immediately) if slimFile already exists, so
 % repeated predpermtest calls against the same training file (e.g. across
 % different sigMode settings) only pay this cost once.
+%
+% Also skips it (returning permtestFile itself as slimFile) if permtestFile
+% was already saved in this flat layout directly -- permtest() now does
+% this by default for the common (single-group) case, making this whole
+% conversion a no-op passthrough for any freshly-generated permtest file.
+% This function, and the actual conversion below, still exist for older
+% permtest.mat files saved before this change (or multi-group runs, which
+% permtest() still saves in the original nested-cell format).
 
 if ~exist('slimFile', 'var') || isempty(slimFile)
     [d, b] = fileparts(permtestFile);
     slimFile = fullfile(d, [b, '_slim.mat']);
+end
+
+vars = who('-file', permtestFile);
+if ismember('Rperm_side1', vars)
+    fprintf('%s is already in the flat, chunk-readable layout -- no conversion needed.\n', permtestFile);
+    slimFile = permtestFile;
+    return
 end
 
 if exist(slimFile, 'file')

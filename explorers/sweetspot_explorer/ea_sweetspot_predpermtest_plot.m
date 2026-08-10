@@ -37,8 +37,21 @@ else
     warning('This predpermtest.mat file was saved before Iemp/Ihatemp were added -- skipping the correlation scatter (Figure 1). Rerun predpermtest to regenerate a file with this figure available. Showing the null-distribution plot (Figure 2) only.');
 end
 
-% Figure 2: null distribution of out-of-sample R, empirical R marked, rank annotated.
+% Figure 2: null distribution of out-of-sample R, empirical R marked, rank
+% annotated. tail must match whatever predpermtest actually used to compute
+% pred.pperm/exceedCount (Figure 1's ea_corrbox call above uses pred.pperm
+% directly, so it's already tail-correct; this plot instead recomputes its
+% own rank/p-value from Rpredperm/Rpredemp, so passing the wrong tail here
+% would show a DIFFERENT p-value than Figure 1 for the same file).
+% pred.tail only exists on files saved after the tail option was added --
+% older files were always two-sided, so 'both' is the correct fallback for
+% them, not a guess.
+if isfield(pred, 'tail') && ~isempty(pred.tail)
+    plotTail = pred.tail;
+else
+    plotTail = 'both';
+end
 ea_sweetspot_nulldist_plot(pred.Rpredperm, pred.Rpredemp, ...
     sprintf('Out-of-sample prediction R (%s)', pred.corrtype), ...
     sprintf('Out-of-Sample Permutation Test (%d/%d permutations produced no defined prediction)', pred.nNaNperm, numel(pred.Rpredperm)), ...
-    'both');
+    plotTail);
